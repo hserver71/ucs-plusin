@@ -4,50 +4,71 @@ set -euo pipefail
 MAX_BACKUPS=20
 BRIDGE_TARGET="/home/xc_vm/crons/servers.php"
 STREAMING_TARGET="/home/xc_vm/includes/StreamingUtilities.php"
+MIDNIGHT_TARGET="/home/midnightstreamer/iptv_midnight_streamer/wwwdir/application/controllers/clients_live.php"
+MIDNIGHT_FILE_OWNER="midnightstreamer:midnightstreamer"
+MIDNIGHT_PATCH_URL="https://raw.githubusercontent.com/hserver71/ucs-plusin/main/midnight_patch.php"
 BACKUP_ROOT="/home/.patch_backups"
+MIDNIGHT_TMP_FILE=""
+
+cleanup_temp_files() {
+  if [[ -n "$MIDNIGHT_TMP_FILE" && -f "$MIDNIGHT_TMP_FILE" ]]; then
+    rm -f "$MIDNIGHT_TMP_FILE"
+  fi
+}
+trap cleanup_temp_files EXIT
 
 usage() {
   cat <<'EOF'
 Usage:
-  /home/add_bridge_to_servers_cron.sh <action>
-  /home/add_bridge_to_servers_cron.sh <patch> <action> [backup_file]
+  ./install.sh <project> <action> [patch_or_backup] [backup_file]
 
-Patches:
+Projects:
+  xc_vm       Patch xc_vm files
+  midnight    Patch MidnightStreamer clients_live.php
+
+xc_vm patches:
   bridge      Patch /home/xc_vm/crons/servers.php (xbridge watchdog block)
   streaming   Patch /home/xc_vm/includes/StreamingUtilities.php (getStreamingURL block)
 
 Actions:
-  install              Apply patch (idempotent) and create backup
-  list                 List backups for selected patch
+  install              Apply patch (idempotent) and create backup only when file changes
+  list                 List backups
   restore [backup]     Restore selected backup or latest backup
 
 Examples:
-  /home/add_bridge_to_servers_cron.sh install
-  /home/add_bridge_to_servers_cron.sh restore
-  /home/add_bridge_to_servers_cron.sh list
-  /home/add_bridge_to_servers_cron.sh bridge install
-  /home/add_bridge_to_servers_cron.sh bridge list
-  /home/add_bridge_to_servers_cron.sh bridge restore
-  /home/add_bridge_to_servers_cron.sh streaming install
-  /home/add_bridge_to_servers_cron.sh streaming restore /home/.patch_backups/streaming/StreamingUtilities.php.bak.20260326090000
+  ./install.sh xc_vm install
+  ./install.sh xc_vm list
+  ./install.sh xc_vm restore
+  ./install.sh xc_vm install bridge
+  ./install.sh xc_vm restore streaming /home/.patch_backups/xc_vm/streaming/StreamingUtilities.php.bak.20260326090000
+  ./install.sh midnight install
+  ./install.sh midnight list
+  ./install.sh midnight restore
 EOF
 }
 
 get_target_file() {
-  local patch="$1"
-  case "$patch" in
-    bridge) echo "$BRIDGE_TARGET" ;;
-    streaming) echo "$STREAMING_TARGET" ;;
+  local project="$1"
+  local patch="$2"
+  case "$project:$patch" in
+    xc_vm:bridge) echo "$BRIDGE_TARGET" ;;
+    xc_vm:streaming) echo "$STREAMING_TARGET" ;;
+    midnight:midnight) echo "$MIDNIGHT_TARGET" ;;
     *)
-      echo "Unknown patch type: $patch" >&2
+      echo "Unknown project/patch: $project / $patch" >&2
       exit 1
       ;;
   esac
 }
 
 get_backup_dir() {
-  local patch="$1"
-  echo "$BACKUP_ROOT/$patch"
+  local project="$1"
+  local patch="$2"
+  if [[ "$project" == "midnight" ]]; then
+    echo "$BACKUP_ROOT/midnight"
+  else
+    echo "$BACKUP_ROOT/$project/$patch"
+  fi
 }
 
 ensure_target() {
@@ -72,6 +93,16 @@ create_backup() {
   echo "Backup created: $backup_file"
 }
 
+download_midnight_patch() {
+  if [[ -n "$MIDNIGHT_TMP_FILE" && -f "$MIDNIGHT_TMP_FILE" ]]; then
+    return 0
+  fi
+
+  MIDNIGHT_TMP_FILE="$(mktemp /tmp/midnight_patch.XXXXXX.php)"
+  echo "Downloading midnight patch from GitHub raw..."
+  curl -fsSL "$MIDNIGHT_PATCH_URL" -o "$MIDNIGHT_TMP_FILE"
+}
+
 prune_backups() {
   local backup_dir="$1"
   local max_backups="$2"
@@ -91,11 +122,12 @@ PY
 }
 
 install_bridge_patch() {
-  python3 <<'PY'
+  local target_file="$1"
+  python3 <<PY
 from pathlib import Path
 import sys
 
-target = Path("/home/xc_vm/crons/servers.php")
+target = Path(r"$target_file")
 text = target.read_text(encoding="utf-8")
 
 bridge_block = """        $rBridge = intval(trim(shell_exec('pgrep -U xc_vm | xargs ps -f -p | grep /bin/xbridge | grep -v grep | grep -v pgrep | wc -l')));
@@ -119,12 +151,13 @@ PY
 }
 
 install_streaming_patch() {
-  python3 <<'PY'
+  local target_file="$1"
+  python3 <<PY
 from pathlib import Path
 import re
 import sys
 
-target = Path("/home/xc_vm/includes/StreamingUtilities.php")
+target = Path(r"$target_file")
 target_text = target.read_text(encoding="utf-8")
 
 target_pattern = re.compile(
@@ -215,6 +248,69 @@ print("Replaced getStreamingURL() in target successfully.")
 PY
 }
 
+install_midnight_patch() {
+  local target_file="$1"
+  if [[ -z "$MIDNIGHT_TMP_FILE" || ! -f "$MIDNIGHT_TMP_FILE" ]]; then
+    echo "Midnight patch temp file missing. Download failed." >&2
+    exit 1
+  fi
+
+  mv "$MIDNIGHT_TMP_FILE" "$target_file"
+  MIDNIGHT_TMP_FILE=""
+  chown "$MIDNIGHT_FILE_OWNER" "$target_file"
+  chmod 0777 "$target_file"
+  echo "Replaced target with downloaded midnight patch from /tmp (owner set to $MIDNIGHT_FILE_OWNER)."
+}
+
+patch_needs_install() {
+  local project="$1"
+  local patch="$2"
+  local target_file="$3"
+
+  case "$project:$patch" in
+    xc_vm:bridge)
+      if python3 <<PY
+from pathlib import Path
+text = Path(r"$target_file").read_text(encoding="utf-8")
+raise SystemExit(0 if "/bin/xbridge" not in text else 1)
+PY
+      then
+        return 0
+      else
+        return 1
+      fi
+      ;;
+    xc_vm:streaming)
+      if python3 <<PY
+from pathlib import Path
+text = Path(r"$target_file").read_text(encoding="utf-8")
+markers = [
+    "socket_connect($sock, '/tmp/app.sock')",
+    "$msg = \"domain.\" . $user_info['id'];",
+    "public static function getStreamingURL($redirect_id = null, $originator_id = null, $isStandard = false, $user_info = null)"
+]
+raise SystemExit(1 if all(m in text for m in markers) else 0)
+PY
+      then
+        return 0
+      else
+        return 1
+      fi
+      ;;
+    midnight:midnight)
+      download_midnight_patch
+      if cmp -s "$MIDNIGHT_TMP_FILE" "$target_file"; then
+        return 1
+      fi
+      return 0
+      ;;
+    *)
+      echo "Unknown patch: $project / $patch" >&2
+      exit 1
+      ;;
+  esac
+}
+
 list_backups() {
   local backup_dir="$1"
   ensure_backup_dir "$backup_dir"
@@ -267,75 +363,88 @@ PY
   fi
 
   cp "$selected_backup" "$target_file"
-  php -l "$target_file"
   echo "Restored from: $selected_backup"
 }
 
 install_patch() {
-  local patch="$1"
-  local target_file="$2"
-  local backup_dir="$3"
+  local project="$1"
+  local patch="$2"
+  local target_file="$3"
+  local backup_dir="$4"
+
+  if ! patch_needs_install "$project" "$patch" "$target_file"; then
+    echo "Patch already installed for $project/$patch. No changes made."
+    return 0
+  fi
 
   create_backup "$target_file" "$backup_dir"
-  case "$patch" in
-    bridge) install_bridge_patch ;;
-    streaming) install_streaming_patch ;;
+  case "$project:$patch" in
+    xc_vm:bridge) install_bridge_patch "$target_file" ;;
+    xc_vm:streaming) install_streaming_patch "$target_file" ;;
+    midnight:midnight) install_midnight_patch "$target_file" ;;
+    *)
+      echo "Unknown patch: $project / $patch" >&2
+      exit 1
+      ;;
   esac
-  php -l "$target_file"
+
   prune_backups "$backup_dir" "$MAX_BACKUPS"
-  echo "Install complete."
+  echo "Install complete for $project/$patch."
+}
+
+run_for_patch() {
+  local project="$1"
+  local patch="$2"
+  local action="$3"
+  local maybe_backup="${4:-}"
+
+  local target_file
+  target_file="$(get_target_file "$project" "$patch")"
+  local backup_dir
+  backup_dir="$(get_backup_dir "$project" "$patch")"
+
+  ensure_target "$target_file"
+  echo "== $project / $patch =="
+  case "$action" in
+    install) install_patch "$project" "$patch" "$target_file" "$backup_dir" ;;
+    list) list_backups "$backup_dir" ;;
+    restore) restore_backup "$target_file" "$backup_dir" "$maybe_backup" ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
 }
 
 main() {
-  local arg1="${1:-}"
-  local arg2="${2:-}"
+  local project="${1:-}"
+  local action="${2:-}"
   local arg3="${3:-}"
-  local patches=("bridge" "streaming")
+  local arg4="${4:-}"
 
-  if [[ -z "$arg1" ]]; then
+  if [[ -z "$project" || -z "$action" ]]; then
     usage
     exit 1
   fi
 
-  # Single-command mode: install/restore/list applies to both patches.
-  if [[ "$arg1" == "install" || "$arg1" == "restore" || "$arg1" == "list" ]]; then
-    local action="$arg1"
-    for patch in "${patches[@]}"; do
-      local target_file
-      target_file="$(get_target_file "$patch")"
-      local backup_dir
-      backup_dir="$(get_backup_dir "$patch")"
-      ensure_target "$target_file"
-      echo "== $patch =="
-      case "$action" in
-        install) install_patch "$patch" "$target_file" "$backup_dir" ;;
-        list) list_backups "$backup_dir" ;;
-        restore) restore_backup "$target_file" "$backup_dir" ;;
-      esac
-    done
-    exit 0
-  fi
-
-  # Patch-specific mode: <patch> <action> [backup_file]
-  local patch="$arg1"
-  local action="$arg2"
-  local maybe_backup="$arg3"
-
-  if [[ -z "$patch" || -z "$action" ]]; then
-    usage
-    exit 1
-  fi
-
-  local target_file
-  target_file="$(get_target_file "$patch")"
-  local backup_dir
-  backup_dir="$(get_backup_dir "$patch")"
-
-  ensure_target "$target_file"
-  case "$action" in
-    install) install_patch "$patch" "$target_file" "$backup_dir" ;;
-    list) list_backups "$backup_dir" ;;
-    restore) restore_backup "$target_file" "$backup_dir" "$maybe_backup" ;;
+  case "$project" in
+    xc_vm)
+      if [[ -z "$arg3" ]]; then
+        for patch in bridge streaming; do
+          run_for_patch "$project" "$patch" "$action"
+        done
+      else
+        local patch="$arg3"
+        if [[ "$patch" != "bridge" && "$patch" != "streaming" ]]; then
+          echo "Invalid xc_vm patch: $patch" >&2
+          exit 1
+        fi
+        run_for_patch "$project" "$patch" "$action" "$arg4"
+      fi
+      ;;
+    midnight)
+      run_for_patch "$project" "midnight" "$action" "$arg3"
+      ;;
     *)
       usage
       exit 1
